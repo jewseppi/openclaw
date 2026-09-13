@@ -20,13 +20,8 @@ import {
 } from "./persist-codec-policy.js";
 import {
   createExplicitSkillRestoreResolver,
-  hasInvalidExplicitSkillSelections,
-  type ExplicitSkillRestoreCandidate,
-  type ExplicitSkillRestoreResolution,
-  type RestoredExplicitSkillSelections,
-} from "./persist-codec-skills.js";
-import {
   describeFollowupForLog,
+  hasInvalidExplicitSkillSelections,
   hasInvalidInputProvenance,
   hasInvalidRestrictiveExecOverrides,
   hasInvalidScheduledToolPolicy,
@@ -48,7 +43,9 @@ import {
   rehydrateRun,
   toPersistedQueueEntry,
   type PersistedFollowupRun,
+  type ExplicitSkillRestoreResolution,
   type PersistedQueueEntry,
+  type RestoredExplicitSkillSelections,
 } from "./persist-codec.js";
 import {
   clearFollowupQueueLocalOwnershipForTest,
@@ -292,9 +289,7 @@ function resolveCurrentRunConfig(): OpenClawConfig {
 type RestoreFailCloseGuard = {
   blocks: (
     item: PersistedFollowupRun,
-    resolveExplicitSkillSelections: (
-      item: ExplicitSkillRestoreCandidate,
-    ) => ExplicitSkillRestoreResolution,
+    resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
   ) => boolean;
   reason: string;
 };
@@ -369,9 +364,7 @@ const RESTORE_FAIL_CLOSE_GUARDS: readonly RestoreFailCloseGuard[] = [
 
 function findRestoreFailCloseReason(
   item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (
-    item: ExplicitSkillRestoreCandidate,
-  ) => ExplicitSkillRestoreResolution,
+  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
 ): string | undefined {
   return RESTORE_FAIL_CLOSE_GUARDS.find((guard) =>
     guard.blocks(item, resolveExplicitSkillSelections),
@@ -380,9 +373,7 @@ function findRestoreFailCloseReason(
 
 function isUnrestorablePersistedFollowup(
   item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (
-    item: ExplicitSkillRestoreCandidate,
-  ) => ExplicitSkillRestoreResolution,
+  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
 ): boolean {
   return findRestoreFailCloseReason(item, resolveExplicitSkillSelections) !== undefined;
 }
@@ -390,9 +381,7 @@ function isUnrestorablePersistedFollowup(
 function failClosedUnrestorablePersistedFollowup(
   queueKey: string,
   item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (
-    item: ExplicitSkillRestoreCandidate,
-  ) => ExplicitSkillRestoreResolution,
+  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
 ): boolean {
   const reason = findRestoreFailCloseReason(item, resolveExplicitSkillSelections);
   if (reason === undefined) {
@@ -410,7 +399,7 @@ function rehydrateRestorablePersistedFollowups(
   currentConfig: OpenClawConfig,
   pairedLines?: readonly string[],
   resolveExplicitSkillSelections: (
-    item: ExplicitSkillRestoreCandidate,
+    item: PersistedFollowupRun,
   ) => ExplicitSkillRestoreResolution = createExplicitSkillRestoreResolver(currentConfig),
 ): { restored: FollowupRun[]; restoredLines: string[]; skippedUnrestorable: boolean } {
   const candidates: Array<{
@@ -496,9 +485,7 @@ function filterRestorableFollowupItems(queueKey: string, items: FollowupRun[]): 
 function isDeliverablePersistedFollowup(
   queueKey: string,
   item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (
-    item: ExplicitSkillRestoreCandidate,
-  ) => ExplicitSkillRestoreResolution,
+  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
 ): boolean {
   const sessionKey = normalizeOptionalString(item.run.sessionKey);
   if (sessionKey && sessionKey !== queueKey && !queueKey.startsWith(`${sessionKey}:`)) {

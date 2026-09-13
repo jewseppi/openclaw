@@ -1,12 +1,13 @@
+import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import type { QueueMode } from "../../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import {
   attachToolAllowlistIntersection,
   readToolAllowlistIntersection,
 } from "../../../agents/tool-policy.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { normalizeCronScheduledToolPolicy } from "../../../cron/scheduled-tool-policy.js";
+import { resolveWorkspaceSkillPromptEntries } from "../../../skills/loading/workspace-skill-loader.js";
 import {
   hasInvalidInputProvenance,
   hasInvalidRestrictiveExecOverrides,
@@ -20,295 +21,13 @@ import {
   projectSessionPermissionPair,
 } from "./persist-codec-policy.js";
 import {
-  projectExplicitSkillSelections,
-  type RestoredExplicitSkillSelections,
-} from "./persist-codec-skills.js";
-import type { FollowupQueueState, FollowupRun, QueueDropPolicy } from "./types.js";
-
-/**
- * Minimal recovery descriptor for FollowupRun["run"]. Persisted fields are the
- * per-message routing and intent inputs that cannot be recovered any other
- * way after a restart. Bulky or secret-bearing runtime state (config,
- * skillsSnapshot, extraSystemPrompt[Static]) is intentionally excluded — the
- * dispatcher reassigns `run.config` via resolveQueuedReplyExecutionConfig on the
- * next turn. Routing selectors (authProfileId[Source], originatingReplyToId)
- * are persisted because restored turns need the same reply target they were
- * queued with. `inputProvenance` is persisted only as a closed non-authoritative
- * `{ kind, sourceChannel, sourceTool }` descriptor; `originSessionId` and
- * `sourceSessionKey` are never written and are stripped from older rows so
- * restore cannot reuse raw source-session identifiers for requester-policy.
- *
- * Session policy and prepared routing captured at admission (`toolOverrides`,
- * `conversationToolPolicy`, `requestedRouteResolution`, `thinkingCatalog`) plus
- * top-level `toolsAllow` / `disableTools` (and the non-enumerable allowlist
- * intersection carrier) are included so a restart cannot broaden tools or
- * re-resolve models away from the queued turn's intent. `permissionMode` and
- * `sessionRoot` are persisted as one closed pair so a session-scoped execution
- * restriction cannot fall back to the default policy after restart. Restore
- * rehydrates the pair together; a half-written or invalid pair fail-closes.
- * `scheduledToolPolicy` is persisted in its closed JSON shape so restored
- * cron/scheduled turns keep their restricted tool authority instead of falling
- * back to sender/group policy.
- *
- * `skillWorkshopProposalRevision` is persisted as a closed
- * `{ agentId, workspaceDir, proposalId, expectedRevisionHash }` envelope so an
- * operator-reviewed Workshop turn cannot lose its proposal/action restriction
- * or revision hash across restart. Invalid persisted constraints fail-close.
- *
- * Delegated live authority (`trustedInternalHandoff`, `runtimePluginToolGrant`)
- * is never serialized. Those queued turns are marked `delegatedAuthority` and
- * fail-closed on restore: copied fields cannot prove the originating claim is
- * still live after a Gateway restart, and draining without them would silently
- * change tool policy. The skip is logged and the SQLite row is dropped so the
- * non-delivery is durable. `terminalReplyExpectation` is persisted so a required
- * reply cannot become optional after restart. Invalid persisted values fail-close.
- *
- * `cliSessionBindingFacts` persists only delivery flags (`sourceReplyDeliveryMode`,
- * `requireExplicitMessageTarget`). Nested `extraSystemPromptStatic` is secret-bearing
- * and is never written; restore also strips it from older rows.
- *
- * Raw channel identities (`senderId`, `senderName`, `senderUsername`,
- * `senderE164`, `channelContext`) are never persisted. Those values are
- * requester-policy inputs, not a closed delivery descriptor; restore strips
- * them from older rows and rewrites SQLite so channel tool-policy cannot reuse
- * stored sender or open-ended transport metadata. Delivery stays on the closed
- * originating route (`originatingChannel` / `originatingTo`). Restored
- * identity-less entries drain individually so collect cannot merge distinct
- * senders that now share an empty authorization key.
- *
- * Sender privilege bits (`senderIsOwner`, `traceAuthorized`, `ownerNumbers`)
- * are never persisted. Restore always fences them to explicit non-owner so
- * owner-only tools cannot reopen from a stored true/undefined default.
- *
- * Exec elevation (`elevatedLevel`, `bashElevated`) and broadening overlays
- * (`security: "full"`, `ask: "off"`, `host: "gateway"|"node"`) are never
- * persisted. Restrictive `execOverrides` (`security: "deny"|"allowlist"`,
- * `ask: "always"|"on-miss"`, `host: "sandbox"`) persist as a closed projection
- * so restart cannot widen exec authority. Restore rehydrates that projection;
- * unknown keys or invalid values fail-close. `node` / `nodeCwd` are never
- * written (they retarget execution).
- *
- * Live client-bound facts (`clientCaps`, `toolBindings`, `approvalReviewerDeviceId`)
- * are never persisted. Restore strips them even from older rows so a queued
- * turn cannot target a stale browser or approval device after restart.
- *
- * Host-minted `memberRoleIds` are never serialized. Role-dependent queued work
- * is marked `roleDependent` and fail-closed on restore: channel roles cannot be
- * revalidated in this persist layer, and draining without them would silently
- * change role-gated authorization. The skip is logged and the SQLite row is
- * dropped so the non-delivery is durable.
- *
- * Use Pick (allowlist), not Omit, so new fields added to FollowupRun["run"]
- * default to NOT persisted until explicitly opted in.
- */
-type PersistedRunFields = Pick<
-  FollowupRun["run"],
-  | "agentId"
-  | "agentDir"
-  | "sessionId"
-  | "sessionKey"
-  | "runtimePolicySessionKey"
-  | "messageProvider"
-  | "chatType"
-  | "agentAccountId"
-  | "groupId"
-  | "groupChannel"
-  | "groupSpace"
-  | "spawnedBy"
-  | "sessionFile"
-  | "workspaceDir"
-  | "cwd"
-  | "permissionMode"
-  | "sessionRoot"
-  | "execOverrides"
-  | "provider"
-  | "model"
-  | "hasSessionModelOverride"
-  | "modelOverrideSource"
-  | "hasAutoFallbackProvenance"
-  | "autoFallbackPrimaryProbe"
-  | "modelSelectionLocked"
-  | "authProfileId"
-  | "authProfileIdSource"
-  | "toolOverrides"
-  | "conversationToolPolicy"
-  | "requestedRouteResolution"
-  | "thinkingCatalog"
-  | "scheduledToolPolicy"
-  | "skillWorkshopProposalRevision"
-  | "terminalReplyExpectation"
-  | "thinkLevel"
-  | "fastMode"
-  | "fastModeAutoOnSeconds"
-  | "fastModeOverride"
-  | "fastModeAutoOnSecondsOverride"
-  | "verboseLevel"
-  | "reasoningLevel"
-  | "timeoutMs"
-  | "runTimeoutOverrideMs"
-  | "blockReplyBreak"
-  | "inputProvenance"
-  | "sourceReplyDeliveryMode"
-  | "taskSuggestionDeliveryMode"
-  | "silentReplyPromptMode"
-  | "cliSessionBindingFacts"
-  | "enforceFinalTag"
-  | "skipProviderRuntimeHints"
-  | "silentExpected"
-  | "allowEmptyAssistantReplyAsSilent"
-  | "suppressNextUserMessagePersistence"
-  | "suppressTranscriptOnlyAssistantPersistence"
->;
-
-/**
- * Subset of FollowupRun that can be safely JSON-serialized across restarts.
- * Runtime-only fields (abortSignal, deliveryCorrelations, queuedLifecycle,
- * userTurnTranscriptRecorder, currentInboundContext) are intentionally excluded.
- * Bounded inbound flags (event kind, audio) are persisted so restored drains
- * keep routing shape; raw current-turn prompt context is never written and is
- * stripped from older rows.
- */
-export type PersistedFollowupRun = Pick<
-  FollowupRun,
-  | "prompt"
-  | "transcriptPrompt"
-  | "messageId"
-  | "summaryLine"
-  | "enqueuedAt"
-  | "imageOrder"
-  | "media"
-  | "currentInboundEventKind"
-  | "currentInboundAudio"
-  | "originatingChannel"
-  | "originatingTo"
-  | "originatingAccountId"
-  | "originatingThreadId"
-  | "originatingReplyToId"
-  | "originatingChatId"
-  | "originatingReplyToMode"
-  | "originatingChatType"
-  | "disableCollectBatching"
-  | "strandedReplyRetry"
-  | "toolsAllow"
-  | "disableTools"
-  | "explicitSkillSelections"
-> & {
-  run: PersistedRunFields;
-  /** Serializable form of the non-enumerable allowlist intersection carrier. */
-  toolsAllowIntersection?: string[][];
-  /**
-   * True when the live run carried host-minted member roles. Restore fail-closes
-   * these items instead of executing without role context or replaying stale IDs.
-   */
-  roleDependent?: true;
-  /**
-   * True when the live run carried delegated handoff or plugin-grant authority.
-   * Restore fail-closes these items instead of replaying a copied claim.
-   */
-  delegatedAuthority?: true;
-  /**
-   * True when the live run was canceled before drain settled. Restore fail-closes
-   * these items because abort signals are not serialized.
-   */
-  canceled?: true;
-  /**
-   * True when channel delivery already succeeded. Restore fail-closes these
-   * items so a crash before the omit-ack cannot replay the follow-up.
-   */
-  delivered?: true;
-  /**
-   * True when execution finished but terminal delivery failed. Restore
-   * fail-closes these items so a crash before omit cannot replay side effects.
-   */
-  discarded?: true;
-  /**
-   * True when the live run carried inline image payloads. Raw image bytes are
-   * never written to shared SQLite; restore fail-closes marked items (and
-   * legacy rows still carrying `images`) instead of replaying a turn whose
-   * image content was deliberately not retained.
-   */
-  inlineImagesElided?: true;
-};
-
-type PersistedSummaryElision = {
-  contextKey: string;
-  count: number;
-  sources: PersistedFollowupRun[];
-  summaryLines: string[];
-};
-
-export type PersistedQueueEntry = {
-  items: PersistedFollowupRun[];
-  lastEnqueuedAt: number;
-  mode: QueueMode;
-  debounceMs: number;
-  cap: number;
-  dropPolicy: QueueDropPolicy;
-  droppedCount: number;
-  summaryLines: string[];
-  summarySources?: PersistedFollowupRun[];
-  summaryElisions?: PersistedSummaryElision[];
-  evictedSummaryCount?: number;
-  lastRun?: PersistedRunFields;
-};
-
-const PERSISTED_RUN_FIELDS = [
-  "agentId",
-  "agentDir",
-  "sessionId",
-  "sessionKey",
-  "runtimePolicySessionKey",
-  "messageProvider",
-  "chatType",
-  "agentAccountId",
-  "groupId",
-  "groupChannel",
-  "groupSpace",
-  "spawnedBy",
-  "sessionFile",
-  "workspaceDir",
-  "cwd",
-  "permissionMode",
-  "sessionRoot",
-  "execOverrides",
-  "provider",
-  "model",
-  "hasSessionModelOverride",
-  "modelOverrideSource",
-  "hasAutoFallbackProvenance",
-  "autoFallbackPrimaryProbe",
-  "modelSelectionLocked",
-  "authProfileId",
-  "authProfileIdSource",
-  "toolOverrides",
-  "conversationToolPolicy",
-  "requestedRouteResolution",
-  "thinkingCatalog",
-  "scheduledToolPolicy",
-  "skillWorkshopProposalRevision",
-  "terminalReplyExpectation",
-  "thinkLevel",
-  "fastMode",
-  "fastModeAutoOnSeconds",
-  "fastModeOverride",
-  "fastModeAutoOnSecondsOverride",
-  "verboseLevel",
-  "reasoningLevel",
-  "timeoutMs",
-  "runTimeoutOverrideMs",
-  "blockReplyBreak",
-  "inputProvenance",
-  "sourceReplyDeliveryMode",
-  "taskSuggestionDeliveryMode",
-  "silentReplyPromptMode",
-  "cliSessionBindingFacts",
-  "enforceFinalTag",
-  "skipProviderRuntimeHints",
-  "silentExpected",
-  "allowEmptyAssistantReplyAsSilent",
-  "suppressNextUserMessagePersistence",
-  "suppressTranscriptOnlyAssistantPersistence",
-] as const satisfies ReadonlyArray<keyof PersistedRunFields>;
+  PERSISTED_RUN_FIELDS,
+  type PersistedFollowupRun,
+  type PersistedQueueEntry,
+  type PersistedRunFields,
+  type PersistedSummaryElision,
+} from "./persist-codec.types.js";
+import type { FollowupQueueState, FollowupRun } from "./types.js";
 
 function asWritableRecord(value: object): Record<string, unknown> {
   // SAFETY: persist copies JSON-shaped objects by closed allowlisted keys.
@@ -510,6 +229,110 @@ export function describeFollowupForLog(item: PersistedFollowupRun): string {
     parts.push(`channel=${item.originatingChannel}`);
   }
   return parts.length > 0 ? parts.join(" ") : "no-route-metadata";
+}
+
+const MAX_EXPLICIT_SKILL_SELECTIONS = 32;
+const MAX_EXPLICIT_SKILL_NAME_LENGTH = 128;
+const MAX_EXPLICIT_SKILL_PATH_LENGTH = 1024;
+
+export type RestoredExplicitSkillSelections = NonNullable<FollowupRun["explicitSkillSelections"]>;
+export type ExplicitSkillRestoreResolution =
+  | { status: "absent" }
+  | { status: "ok"; selections: RestoredExplicitSkillSelections }
+  | { status: "invalid" };
+
+function comparableSkillPath(value: string): string {
+  const resolved = path.resolve(value);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function projectExplicitSkillSelections(
+  value: unknown,
+): RestoredExplicitSkillSelections | undefined {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_EXPLICIT_SKILL_SELECTIONS) {
+    return undefined;
+  }
+  const projected: RestoredExplicitSkillSelections = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) {
+      return undefined;
+    }
+    const name = normalizeOptionalString(entry.name);
+    const skillPath = normalizeOptionalString(entry.path);
+    if (
+      !name ||
+      !skillPath ||
+      name.length > MAX_EXPLICIT_SKILL_NAME_LENGTH ||
+      skillPath.length > MAX_EXPLICIT_SKILL_PATH_LENGTH
+    ) {
+      return undefined;
+    }
+    projected.push({ name, path: skillPath });
+  }
+  return projected;
+}
+
+export function createExplicitSkillRestoreResolver(
+  currentConfig: OpenClawConfig,
+): (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution {
+  const catalogs = new Map<string, Array<{ name: string; path: string }> | null>();
+  const loadCatalog = (workspaceDir: string, agentId: string | undefined) => {
+    const key = `${workspaceDir}\0${agentId ?? ""}`;
+    if (catalogs.has(key)) {
+      return catalogs.get(key) ?? null;
+    }
+    try {
+      const eligible = resolveWorkspaceSkillPromptEntries(workspaceDir, {
+        config: currentConfig,
+        agentId,
+      }).eligible.map((entry) => ({
+        name: entry.skill.name,
+        path: entry.skill.filePath,
+      }));
+      catalogs.set(key, eligible);
+      return eligible;
+    } catch {
+      catalogs.set(key, null);
+      return null;
+    }
+  };
+
+  return (item: PersistedFollowupRun): ExplicitSkillRestoreResolution => {
+    if (item.explicitSkillSelections === undefined) {
+      return { status: "absent" };
+    }
+    const projected = projectExplicitSkillSelections(item.explicitSkillSelections);
+    if (!projected) {
+      return { status: "invalid" };
+    }
+    const workspaceDir = normalizeOptionalString(item.run.workspaceDir);
+    if (!workspaceDir) {
+      return { status: "invalid" };
+    }
+    const catalog = loadCatalog(workspaceDir, normalizeOptionalString(item.run.agentId));
+    if (!catalog) {
+      return { status: "invalid" };
+    }
+    const resolved: RestoredExplicitSkillSelections = [];
+    for (const selection of projected) {
+      const selectedPath = comparableSkillPath(selection.path);
+      const skill = catalog.find(
+        (candidate) => comparableSkillPath(candidate.path) === selectedPath,
+      );
+      if (!skill) {
+        return { status: "invalid" };
+      }
+      resolved.push({ name: skill.name, path: skill.path });
+    }
+    return { status: "ok", selections: resolved };
+  };
+}
+
+export function hasInvalidExplicitSkillSelections(
+  item: PersistedFollowupRun,
+  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
+): boolean {
+  return resolveExplicitSkillSelections(item).status === "invalid";
 }
 
 export function hasInvalidScheduledToolPolicy(run: PersistedRunFields): boolean {
@@ -837,3 +660,9 @@ export function rehydratePersistedFollowupRun(
   }
   return restored;
 }
+
+export type {
+  PersistedFollowupRun,
+  PersistedQueueEntry,
+  PersistedRunFields,
+} from "./persist-codec.types.js";
