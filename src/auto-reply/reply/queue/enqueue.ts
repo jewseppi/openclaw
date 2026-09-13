@@ -87,7 +87,7 @@ function appendQueueItem(params: {
   runFollowup?: (run: FollowupRun) => Promise<void>;
   restartIfIdle: boolean;
   front: boolean;
-}): { releaseRecentMessageId?: () => void } {
+}): { releaseRecentMessageId: (() => void) | undefined } {
   params.queue.lastEnqueuedAt = Date.now();
   params.queue.lastRun = params.run.run;
   params.run.queueAbortSignal = params.queue.abortController.signal;
@@ -124,7 +124,7 @@ function appendQueueItem(params: {
   if (params.restartIfIdle && !params.queue.draining) {
     kickFollowupDrainIfIdle(params.key);
   }
-  return { ...(releaseRecentMessageId ? { releaseRecentMessageId } : {}) };
+  return { releaseRecentMessageId };
 }
 
 function captureQueueMutationState(queue: FollowupQueueState) {
@@ -200,7 +200,7 @@ function appendQueueItemWithPersist(params: Parameters<typeof appendQueueItem>[0
     return rollbackFailedDurableAdmission({
       key: params.key,
       run: params.run,
-      ...(releaseRecentMessageId ? { releaseRecentMessageId } : {}),
+      releaseRecentMessageId,
       restore: () => {
         params.queue.items.length = 0;
         params.queue.items.push(...itemsSnapshot);
@@ -437,7 +437,7 @@ export function enqueueFollowupRun(
       return rollbackFailedDurableAdmission({
         key,
         run,
-        ...(releaseRecentMessageId ? { releaseRecentMessageId } : {}),
+        releaseRecentMessageId,
         restore: restoreAdmissionSnapshot,
         err,
       });

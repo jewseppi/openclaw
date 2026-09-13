@@ -96,7 +96,7 @@ describe("persistFollowupQueues / restoreFollowupQueues", () => {
     const queue = getFollowupQueue(TEST_KEY, SETTINGS);
     queue.items.push(makeFollowupRun("fresh work"));
     persistFollowupQueuesOrThrow();
-    expect(listFollowupQueueKeys().sort()).toEqual(["other-process-key", TEST_KEY].sort());
+    expect(listFollowupQueueKeys().toSorted()).toEqual(["other-process-key", TEST_KEY].toSorted());
   });
 
   it("keeps incognito queues out of the durable snapshot", () => {

@@ -4,8 +4,6 @@ import { getRuntimeConfigSnapshot } from "../../../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import {
   hasFollowupQueueEntries,
-  listFollowupQueueKeys,
-  listUnreadableFollowupQueueKeys,
   loadFollowupQueueEntries,
   replaceFollowupQueueEntries,
 } from "../../../infra/followup-queue-sqlite.js";
@@ -15,7 +13,6 @@ import {
   resolveGlobalSet,
   resolveGlobalSingleton,
 } from "../../../shared/global-singleton.js";
-import { isIncognitoSessionKey } from "../../../shared/incognito-session-key.js";
 import { normalizeQueueDropPolicy, normalizeQueueMode } from "./normalize.js";
 import {
   isExpiredPersistedFollowup,
@@ -24,6 +21,7 @@ import {
 import {
   createExplicitSkillRestoreResolver,
   hasInvalidExplicitSkillSelections,
+  type ExplicitSkillRestoreCandidate,
   type ExplicitSkillRestoreResolution,
   type RestoredExplicitSkillSelections,
 } from "./persist-codec-skills.js";
@@ -52,6 +50,13 @@ import {
   type PersistedFollowupRun,
   type PersistedQueueEntry,
 } from "./persist-codec.js";
+import {
+  clearFollowupQueueLocalOwnershipForTest,
+  isIncognitoFollowupQueue,
+  markFollowupQueueKeyLocallyOwned,
+  persistedQueueEntryCarriesWork,
+  resolveFollowupQueueRetainKeys,
+} from "./persist-snapshot-policy.js";
 import type { FollowupQueueState, FollowupRun, QueueDropPolicy } from "./types.js";
 
 const DEFAULT_QUEUE_DEBOUNCE_MS = 500;
@@ -77,34 +82,6 @@ const restoredPendingDrainKeys = resolveGlobalSet<string>(
   Symbol.for("openclaw.followupQueueRestoredPendingDrainKeys"),
   "close-and-restart",
 );
-
-/**
- * Queue keys this process has taken authority over, either by materializing the
- * queue in memory or by restoring its durable row. Snapshot replacement may only
- * delete rows for these keys: until restore completes, every other row still
- * belongs to the previous process and has not been reconciled.
- */
-const locallyOwnedQueueKeys = resolveGlobalSet<string>(
-  Symbol.for("openclaw.followupQueueLocallyOwnedKeys"),
-  "close-and-restart",
-);
-
-/** Claim durable delete authority for `key` before its first snapshot write. */
-export function markFollowupQueueKeyLocallyOwned(key: string): void {
-  const cleaned = key.trim();
-  if (cleaned) {
-    locallyOwnedQueueKeys.add(cleaned);
-  }
-}
-
-/**
- * Hand durable delete authority for `key` back to the next process. Restart
- * retirement uses this so an unrelated queue's later snapshot cannot delete a
- * row that startup recovery is expected to replay.
- */
-export function releaseFollowupQueueKeyLocalOwnership(key: string): void {
-  locallyOwnedQueueKeys.delete(key.trim());
-}
 
 export function peekRestoredPendingDrainKeys(): ReadonlySet<string> {
   return restoredPendingDrainKeys;
@@ -270,7 +247,7 @@ function scheduleFollowupQueueRestoreRetry(): void {
 /** For testing only — reset the restore-once flag between test cases. */
 export function clearFollowupQueuesRestoredFlagForTest(): void {
   unmarkFollowupQueuesRestored();
-  locallyOwnedQueueKeys.clear();
+  clearFollowupQueueLocalOwnershipForTest();
   restoreCoordination.inFlight = false;
   restoreCoordination.retryCount = 0;
   clearFollowupQueueRestoreRetryTimer();
@@ -315,7 +292,9 @@ function resolveCurrentRunConfig(): OpenClawConfig {
 type RestoreFailCloseGuard = {
   blocks: (
     item: PersistedFollowupRun,
-    resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
+    resolveExplicitSkillSelections: (
+      item: ExplicitSkillRestoreCandidate,
+    ) => ExplicitSkillRestoreResolution,
   ) => boolean;
   reason: string;
 };
@@ -390,7 +369,9 @@ const RESTORE_FAIL_CLOSE_GUARDS: readonly RestoreFailCloseGuard[] = [
 
 function findRestoreFailCloseReason(
   item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
+  resolveExplicitSkillSelections: (
+    item: ExplicitSkillRestoreCandidate,
+  ) => ExplicitSkillRestoreResolution,
 ): string | undefined {
   return RESTORE_FAIL_CLOSE_GUARDS.find((guard) =>
     guard.blocks(item, resolveExplicitSkillSelections),
@@ -399,7 +380,9 @@ function findRestoreFailCloseReason(
 
 function isUnrestorablePersistedFollowup(
   item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
+  resolveExplicitSkillSelections: (
+    item: ExplicitSkillRestoreCandidate,
+  ) => ExplicitSkillRestoreResolution,
 ): boolean {
   return findRestoreFailCloseReason(item, resolveExplicitSkillSelections) !== undefined;
 }
@@ -407,7 +390,9 @@ function isUnrestorablePersistedFollowup(
 function failClosedUnrestorablePersistedFollowup(
   queueKey: string,
   item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
+  resolveExplicitSkillSelections: (
+    item: ExplicitSkillRestoreCandidate,
+  ) => ExplicitSkillRestoreResolution,
 ): boolean {
   const reason = findRestoreFailCloseReason(item, resolveExplicitSkillSelections);
   if (reason === undefined) {
@@ -425,7 +410,7 @@ function rehydrateRestorablePersistedFollowups(
   currentConfig: OpenClawConfig,
   pairedLines?: readonly string[],
   resolveExplicitSkillSelections: (
-    item: PersistedFollowupRun,
+    item: ExplicitSkillRestoreCandidate,
   ) => ExplicitSkillRestoreResolution = createExplicitSkillRestoreResolver(currentConfig),
 ): { restored: FollowupRun[]; restoredLines: string[]; skippedUnrestorable: boolean } {
   const candidates: Array<{
@@ -511,7 +496,9 @@ function filterRestorableFollowupItems(queueKey: string, items: FollowupRun[]): 
 function isDeliverablePersistedFollowup(
   queueKey: string,
   item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
+  resolveExplicitSkillSelections: (
+    item: ExplicitSkillRestoreCandidate,
+  ) => ExplicitSkillRestoreResolution,
 ): boolean {
   const sessionKey = normalizeOptionalString(item.run.sessionKey);
   if (sessionKey && sessionKey !== queueKey && !queueKey.startsWith(`${sessionKey}:`)) {
@@ -622,63 +609,6 @@ function persistedQueueEntryCarriesInboundContext(data: PersistedQueueEntry): bo
     ...(data.summarySources ?? []),
     ...(data.summaryElisions ?? []).flatMap((elision) => elision.sources),
   ].some(persistedFollowupItemCarriesInboundContext);
-}
-
-/** Whether a projected entry still carries recoverable work worth a durable row. */
-function persistedQueueEntryCarriesWork(entry: PersistedQueueEntry): boolean {
-  return (
-    entry.items.length > 0 ||
-    (entry.summarySources ?? []).length > 0 ||
-    (entry.summaryElisions ?? []).some((elision) => elision.sources.length > 0) ||
-    entry.droppedCount > 0
-  );
-}
-
-function followupQueueRuns(queue: FollowupQueueState): FollowupRun[] {
-  return [
-    ...queue.items,
-    ...queue.inFlight,
-    ...queue.summarySources,
-    ...queue.summaryElisions.flatMap((elision) => elision.sources),
-  ];
-}
-
-/**
- * Incognito sessions are process-memory only: the session owner routes their
- * agent database to `:memory:` and `docs/concepts/session.md` promises the
- * content never reaches disk. A durable queue snapshot would bypass that owner,
- * so incognito queues stay in memory and are never restored.
- */
-function isIncognitoFollowupQueue(key: string, queue: FollowupQueueState): boolean {
-  if (isIncognitoSessionKey(key)) {
-    return true;
-  }
-  // The queue key falls back to a session id when the route has no session key,
-  // so classify by the session key each queued run carries as well.
-  return (
-    isIncognitoSessionKey(queue.lastRun?.sessionKey) ||
-    followupQueueRuns(queue).some((item) => isIncognitoSessionKey(item.run.sessionKey))
-  );
-}
-
-/**
- * Keys that must survive snapshot replacement.
- *
- * Unreadable rows are always retained because this writer cannot reconstruct
- * them. Rows this process has never owned are retained too: queue mutations stay
- * enabled while a failed restore retries, so a snapshot built from memory-only
- * queues would otherwise delete durable work that was never loaded. Incognito
- * keys are never retained, so rows leaked by an older build get cleaned up.
- */
-function resolveFollowupQueueRetainKeys(): string[] {
-  const unreadable = listUnreadableFollowupQueueKeys();
-  const retained = new Set(unreadable);
-  for (const key of listFollowupQueueKeys()) {
-    if (!locallyOwnedQueueKeys.has(key)) {
-      retained.add(key);
-    }
-  }
-  return [...retained].filter((key) => !isIncognitoSessionKey(key));
 }
 
 export function persistFollowupQueuesOrThrow(): void {

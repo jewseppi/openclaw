@@ -8,10 +8,12 @@ import { resolveGlobalMap } from "../../../shared/global-singleton.js";
 import { applyQueueRuntimeSettings } from "../../../utils/queue-helpers.js";
 import { normalizeThinkLevel, resolveSupportedThinkingLevel } from "../../thinking.js";
 import {
-  clearRestoredPendingDrainKey,
   markFollowupQueueKeyLocallyOwned,
-  persistFollowupQueuesOrThrow,
   releaseFollowupQueueKeyLocalOwnership,
+} from "./persist-snapshot-policy.js";
+import {
+  clearRestoredPendingDrainKey,
+  persistFollowupQueuesOrThrow,
   restoreFollowupQueues,
 } from "./persist.js";
 import {

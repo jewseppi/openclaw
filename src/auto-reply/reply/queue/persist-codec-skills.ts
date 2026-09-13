@@ -9,8 +9,17 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { resolveWorkspaceSkillPromptEntries } from "../../../skills/loading/workspace-skill-loader.js";
-import type { PersistedFollowupRun } from "./persist-codec.js";
 import type { FollowupRun } from "./types.js";
+
+/**
+ * Leaf contract for the fields this resolver reads. Declared structurally rather
+ * than importing `PersistedFollowupRun`, which would make this module and the
+ * persistence codec mutually dependent.
+ */
+export type ExplicitSkillRestoreCandidate = {
+  explicitSkillSelections?: unknown;
+  run: { workspaceDir?: string; agentId?: string };
+};
 
 const MAX_EXPLICIT_SKILL_SELECTIONS = 32;
 const MAX_EXPLICIT_SKILL_NAME_LENGTH = 128;
@@ -55,7 +64,7 @@ export function projectExplicitSkillSelections(
 
 export function createExplicitSkillRestoreResolver(
   currentConfig: OpenClawConfig,
-): (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution {
+): (item: ExplicitSkillRestoreCandidate) => ExplicitSkillRestoreResolution {
   const catalogs = new Map<string, Array<{ name: string; path: string }> | null>();
   const loadCatalog = (workspaceDir: string, agentId: string | undefined) => {
     const key = `${workspaceDir}\0${agentId ?? ""}`;
@@ -78,7 +87,7 @@ export function createExplicitSkillRestoreResolver(
     }
   };
 
-  return (item: PersistedFollowupRun): ExplicitSkillRestoreResolution => {
+  return (item: ExplicitSkillRestoreCandidate): ExplicitSkillRestoreResolution => {
     if (item.explicitSkillSelections === undefined) {
       return { status: "absent" };
     }
@@ -110,8 +119,10 @@ export function createExplicitSkillRestoreResolver(
 }
 
 export function hasInvalidExplicitSkillSelections(
-  item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
+  item: ExplicitSkillRestoreCandidate,
+  resolveExplicitSkillSelections: (
+    item: ExplicitSkillRestoreCandidate,
+  ) => ExplicitSkillRestoreResolution,
 ): boolean {
   return resolveExplicitSkillSelections(item).status === "invalid";
 }
