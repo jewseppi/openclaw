@@ -47,42 +47,9 @@ export function releaseFollowupQueueKeyLocalOwnership(key: string): void {
   locallyOwnedQueueKeys.delete(key.trim());
 }
 
-/**
- * Live queues whose durable row could not be read when they materialized. The
- * row may still hold the previous process's work, and a snapshot upsert would
- * replace it with only the live entries, so snapshots skip these keys until
- * restore merges both.
- */
-const unreconciledQueueKeys = resolveGlobalSet<string>(
-  Symbol.for("openclaw.followupQueueUnreconciledKeys"),
-  "close-and-restart",
-);
-
-export function markFollowupQueueKeyUnreconciled(key: string): void {
-  const cleaned = key.trim();
-  if (cleaned) {
-    unreconciledQueueKeys.add(cleaned);
-  }
-}
-
-export function isFollowupQueueKeyUnreconciled(key: string): boolean {
-  return unreconciledQueueKeys.has(key.trim());
-}
-
-/** Claim delete authority for every unreconciled key and return the keys claimed. */
-export function claimUnreconciledFollowupQueueKeys(): string[] {
-  const claimed = [...unreconciledQueueKeys];
-  unreconciledQueueKeys.clear();
-  for (const key of claimed) {
-    locallyOwnedQueueKeys.add(key);
-  }
-  return claimed;
-}
-
 /** For testing only — drop all claimed delete authority between cases. */
 export function clearFollowupQueueLocalOwnershipForTest(): void {
   locallyOwnedQueueKeys.clear();
-  unreconciledQueueKeys.clear();
 }
 
 function followupQueueRuns(queue: FollowupQueueState): FollowupRun[] {

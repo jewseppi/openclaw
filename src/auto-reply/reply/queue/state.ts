@@ -9,7 +9,6 @@ import { applyQueueRuntimeSettings } from "../../../utils/queue-helpers.js";
 import { normalizeThinkLevel, resolveSupportedThinkingLevel } from "../../thinking.js";
 import {
   markFollowupQueueKeyLocallyOwned,
-  markFollowupQueueKeyUnreconciled,
   releaseFollowupQueueKeyLocalOwnership,
 } from "./persist-snapshot-policy.js";
 import {
@@ -185,6 +184,12 @@ export function getFollowupQueue(key: string, settings: QueueSettings): Followup
     persistCapDrivenElisionTrim(restored);
     return restored;
   }
+  if (reconciliation.kind === "unreadable") {
+    // The row exists but its contents are unknown. A queue created now could
+    // only admit work by replacing that row, so refuse to materialize it; the
+    // caller rejects the turn and the next attempt reads the row again.
+    throw new Error(`followup queue ${key} has a durable row that could not be read`);
+  }
 
   const created: FollowupQueueState = {
     abortController: new AbortController(),
@@ -214,15 +219,9 @@ export function getFollowupQueue(key: string, settings: QueueSettings): Followup
     target: created,
     settings,
   });
-  if (reconciliation.kind === "unreadable") {
-    // The row exists in an unknown state. Leave the key unclaimed so snapshots
-    // neither replace nor delete it; restore merges both once it can read it.
-    markFollowupQueueKeyUnreconciled(key);
-  } else {
-    // Materializing the queue takes durable delete authority for this key, so a
-    // later snapshot may remove its row once the queue empties.
-    markFollowupQueueKeyLocallyOwned(key);
-  }
+  // Materializing the queue takes durable delete authority for this key, so a
+  // later snapshot may remove its row once the queue empties.
+  markFollowupQueueKeyLocallyOwned(key);
   FOLLOWUP_QUEUES.set(key, created);
   return created;
 }

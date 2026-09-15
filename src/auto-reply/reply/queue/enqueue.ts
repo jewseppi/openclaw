@@ -265,7 +265,17 @@ export function enqueueFollowupRun(
   if (recentMessageIdKey && peekRecentQueueMessageId(recentMessageIdKey)) {
     return false;
   }
-  const queue = getFollowupQueue(key, settings);
+  let queue: ReturnType<typeof getFollowupQueue>;
+  try {
+    queue = getFollowupQueue(key, settings);
+  } catch (err) {
+    // The key's durable row could not be reconciled, so this turn cannot be made
+    // durable. Reject it like a failed durable admission instead of accepting work
+    // a restart would lose; completing the lifecycle hands an ingress claim back.
+    defaultRuntime.error?.(`rejected followup enqueue for ${key}: ${String(err)}`);
+    completeFollowupRunLifecycle(run);
+    return false;
+  }
 
   const dedupe = dedupeMode === "none" ? undefined : isRunAlreadyQueued;
 

@@ -386,11 +386,6 @@ function startPendingSessionDeliveryRuntime(params: {
   };
 }
 
-function recoverRestoredFollowupQueues(params: { log: GatewayRuntimeServiceLogger }): () => void {
-  return scheduleRestoredFollowupQueueRecovery({
-    log: params.log.child("followup-queue-recovery"),
-  });
-}
 /** Activates background gateway services after core runtime startup is ready. */
 export function activateGatewayScheduledServices(params: {
   minimalTestGateway: boolean;
@@ -474,7 +469,7 @@ export function activateGatewayScheduledServices(params: {
     cfg: params.cfgAtStart,
     log: params.log,
   });
-  const stopFollowupQueueRecovery = recoverRestoredFollowupQueues({ log: params.log });
+  const stopFollowupQueueRecovery = scheduleRestoredFollowupQueueRecovery();
   let deliveryRecoveryStopPromise: Promise<void> | undefined;
   const stopDeliveryRecovery = () => {
     // Both owners fence synchronously before the close prelude awaits either.

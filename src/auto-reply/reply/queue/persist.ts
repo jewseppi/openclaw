@@ -21,15 +21,12 @@ import {
   type PersistedQueueEntry,
 } from "./persist-codec.js";
 import {
-  bindRestoredRunsToQueueAbort,
   isDeliverablePersistedFollowup,
   restorePersistedFollowupQueueEntry,
 } from "./persist-restore-entry.js";
 import {
-  claimUnreconciledFollowupQueueKeys,
   clearFollowupQueueLocalOwnershipForTest,
   isFollowupQueueKeyLocallyOwned,
-  isFollowupQueueKeyUnreconciled,
   isIncognitoFollowupQueue,
   markFollowupQueueKeyLocallyOwned,
   persistedQueueEntryCarriesWork,
@@ -329,11 +326,6 @@ export function persistFollowupQueuesOrThrow(): void {
     if (isIncognitoFollowupQueue(key, queue)) {
       continue;
     }
-    if (isFollowupQueueKeyUnreconciled(key)) {
-      // The row could not be read when this queue materialized; an upsert would
-      // replace work this process never loaded. Restore merges and writes both.
-      continue;
-    }
     const entry = toPersistedQueueEntry(queue);
     if (!persistedQueueEntryCarriesWork(entry)) {
       // Nothing in this queue is eligible for durable custody here.
@@ -360,34 +352,15 @@ export function persistFollowupQueues(): void {
   }
 }
 
-/**
- * Register a restored row. A live queue that materialized while this key's row
- * was unreadable keeps its newer work behind the restored entries.
- */
-function installRestoredFollowupQueue(
-  key: string,
-  restored: FollowupQueueState,
-  mergeIntoLiveQueue: boolean,
-): FollowupQueueState {
-  const live = FOLLOWUP_QUEUES.get(key);
-  let queue = restored;
-  if (live && mergeIntoLiveQueue) {
-    live.items.unshift(...restored.items);
-    live.summarySources.unshift(...restored.summarySources);
-    live.summaryLines.unshift(...restored.summaryLines);
-    live.summaryElisions.unshift(...restored.summaryElisions);
-    live.droppedCount += restored.droppedCount;
-    live.evictedSummaryCount += restored.evictedSummaryCount;
-    live.lastRun ??= restored.lastRun;
-    bindRestoredRunsToQueueAbort(live);
-    queue = live;
-  } else {
-    FOLLOWUP_QUEUES.set(key, restored);
-  }
-  if (queue.items.length > 0 || queue.droppedCount > 0 || queue.summarySources.length > 0) {
+function installRestoredFollowupQueue(key: string, restored: FollowupQueueState): void {
+  FOLLOWUP_QUEUES.set(key, restored);
+  if (
+    restored.items.length > 0 ||
+    restored.droppedCount > 0 ||
+    restored.summarySources.length > 0
+  ) {
     restoredPendingDrainKeys.add(key);
   }
-  return queue;
 }
 
 export type DurableFollowupQueueReconciliation =
@@ -401,7 +374,8 @@ export type DurableFollowupQueueReconciliation =
  * Until startup restore completes, the row may still hold the previous
  * process's work, and the next snapshot upsert would replace it with only the
  * live entries. Restore that row first. When it cannot be read, report it so the
- * caller leaves the key unreconciled and restore merges both later.
+ * caller refuses to admit work for this key rather than accept work it cannot
+ * make durable.
  */
 export function reconcileDurableFollowupQueueKey(key: string): DurableFollowupQueueReconciliation {
   if (hasFollowupQueuesRestored() || isFollowupQueueKeyLocallyOwned(key)) {
@@ -425,12 +399,14 @@ export function reconcileDurableFollowupQueueKey(key: string): DurableFollowupQu
     currentConfig,
     createExplicitSkillRestoreResolver(currentConfig),
   );
-  const queue = entry.queue ? installRestoredFollowupQueue(key, entry.queue, false) : undefined;
+  if (entry.queue) {
+    installRestoredFollowupQueue(key, entry.queue);
+  }
   if (entry.needsRewrite) {
     persistFollowupQueues();
   }
   notifyRestoredFollowupQueuesIfPending();
-  return queue ? { kind: "restored", queue } : { kind: "reconciled" };
+  return entry.queue ? { kind: "restored", queue: entry.queue } : { kind: "reconciled" };
 }
 
 /**
@@ -473,7 +449,6 @@ export function restoreFollowupQueues(): void {
           // A live queue already reconciled this row before restore could run.
           continue;
         }
-        const mergeIntoLiveQueue = isFollowupQueueKeyUnreconciled(key);
         // Reading the row transfers delete authority to this process, including
         // for rows that fail closed below — the sanitizing persist must be able to
         // remove them rather than retain them as unreconciled durable work.
@@ -486,16 +461,11 @@ export function restoreFollowupQueues(): void {
         );
         needsRewrite ||= restored.needsRewrite;
         if (restored.queue) {
-          installRestoredFollowupQueue(key, restored.queue, mergeIntoLiveQueue);
+          installRestoredFollowupQueue(key, restored.queue);
         }
       }
     }
-    // Live queues whose rows were unreadable are reconciled now — merged above
-    // or backed by no row — so their work becomes durable with this snapshot.
-    const claimedLiveWork = claimUnreconciledFollowupQueueKeys().some((key) =>
-      FOLLOWUP_QUEUES.has(key),
-    );
-    if (needsRewrite || claimedLiveWork) {
+    if (needsRewrite) {
       // Durable non-delivery: drop fail-closed rows, and rewrite descriptors
       // that still carried raw source-session provenance, sender/channel
       // identities, or current-turn inbound prompt context so restart cannot

@@ -73,10 +73,13 @@ export function wakeRestoredFollowupQueueSessions(): number {
   return woke;
 }
 
-export function scheduleRestoredFollowupQueueRecovery(params: {
-  log: { error: (message: string) => void };
-  delayMs?: number;
-}): () => void {
+export function scheduleRestoredFollowupQueueRecovery(
+  params: {
+    log?: { error: (message: string) => void };
+    delayMs?: number;
+  } = {},
+): () => void {
+  const recoveryLog = params.log ?? log;
   let disposed = false;
   const wakeOrLog = () => {
     if (disposed) {
@@ -85,7 +88,7 @@ export function scheduleRestoredFollowupQueueRecovery(params: {
     try {
       wakeRestoredFollowupQueueSessions();
     } catch (err: unknown) {
-      params.log.error(`Followup queue recovery failed: ${String(err)}`);
+      recoveryLog.error(`Followup queue recovery failed: ${String(err)}`);
     }
   };
   // Restore retries can succeed after the one-shot startup timer. Re-wake then.

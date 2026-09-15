@@ -4,6 +4,7 @@ import { clearRuntimeConfigSnapshot } from "../../../config/runtime-snapshot.js"
 import { followupQueueEntryContainsPrompt } from "../../../infra/followup-queue-sqlite.js";
 import * as followupQueueSqlite from "../../../infra/followup-queue-sqlite.js";
 import { defaultRuntime } from "../../../runtime.js";
+import { enqueueFollowupRun } from "./enqueue.js";
 import {
   clearFollowupQueuesRestoredFlagForTest,
   clearRestoredPendingDrainKeysForTest,
@@ -19,6 +20,8 @@ import {
 import { resetRecentQueuedMessageIdDedupe } from "./recent-message-ids.js";
 import { FOLLOWUP_QUEUES, getFollowupQueue } from "./state.js";
 import type { FollowupRun } from "./types.js";
+
+const FOLLOWUP_SETTINGS = { ...SETTINGS, mode: "followup" as const, debounceMs: 0 };
 
 function prompts(items: readonly FollowupRun[] | undefined): string[] {
   return (items ?? []).map((item) => item.prompt);
@@ -103,7 +106,7 @@ describe("followup queue durable custody", () => {
     expect(prompts(queue.items)).toEqual(["previous-process work", "fresh work"]);
   });
 
-  it("leaves an unreadable row intact and merges it with live work once restore reads it", () => {
+  it("rejects admission while the key's row is unreadable, then admits behind it", () => {
     leavePreviousProcessRow("previous-process work");
     vi.spyOn(followupQueueSqlite, "loadFollowupQueueEntries").mockImplementationOnce(() => {
       throw busySqlite();
@@ -112,18 +115,29 @@ describe("followup queue durable custody", () => {
       throw busySqlite();
     });
     restoreFollowupQueues();
+    const enqueue = () =>
+      enqueueFollowupRun(
+        TEST_KEY,
+        makeFollowupRun("fresh work"),
+        FOLLOWUP_SETTINGS,
+        "message-id",
+        undefined,
+        false,
+      );
 
-    const queue = getFollowupQueue(TEST_KEY, SETTINGS);
-    queue.items.push(makeFollowupRun("fresh work"));
-    persistFollowupQueuesOrThrow();
-
-    // A snapshot that could not read the row must not replace it.
+    // Accepting now would report success for a turn that no row holds, so a
+    // restart before reconciliation would lose it.
+    expect(enqueue()).toBe(false);
+    expect(FOLLOWUP_QUEUES.get(TEST_KEY)).toBeUndefined();
     expect(followupQueueEntryContainsPrompt(TEST_KEY, "previous-process work")).toBe(true);
     expect(followupQueueEntryContainsPrompt(TEST_KEY, "fresh work")).toBe(false);
 
-    restoreFollowupQueues();
-    expect(FOLLOWUP_QUEUES.get(TEST_KEY)).toBe(queue);
-    expect(prompts(queue.items)).toEqual(["previous-process work", "fresh work"]);
+    // Once the row reads, the retried turn queues durably behind the earlier work.
+    expect(enqueue()).toBe(true);
+    expect(prompts(FOLLOWUP_QUEUES.get(TEST_KEY)?.items)).toEqual([
+      "previous-process work",
+      "fresh work",
+    ]);
     expect(followupQueueEntryContainsPrompt(TEST_KEY, "previous-process work")).toBe(true);
     expect(followupQueueEntryContainsPrompt(TEST_KEY, "fresh work")).toBe(true);
   });
