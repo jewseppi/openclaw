@@ -50,12 +50,12 @@ import type { FollowupRun, QueueDropPolicy } from "./types.js";
  *
  * Raw channel identities (`senderId`, `senderName`, `senderUsername`,
  * `senderE164`, `channelContext`) are never persisted. Those values are
- * requester-policy inputs, not a closed delivery descriptor; restore strips
- * them from older rows and rewrites SQLite so channel tool-policy cannot reuse
- * stored sender or open-ended transport metadata. Delivery stays on the closed
- * originating route (`originatingChannel` / `originatingTo`). Restored
- * identity-less entries drain individually so collect cannot merge distinct
- * senders that now share an empty authorization key.
+ * requester-policy inputs, and without them restore cannot re-run channel
+ * access policy, so turns that carry them are left out of the snapshot entirely
+ * and older rows that still carry them fail closed and are removed from SQLite.
+ * Delivery stays on the closed originating route (`originatingChannel` /
+ * `originatingTo`). Restored identity-less entries drain individually so
+ * collect cannot merge entries that share an empty authorization key.
  *
  * Sender privilege bits (`senderIsOwner`, `traceAuthorized`, `ownerNumbers`)
  * are never persisted. Restore always fences them to explicit non-owner so

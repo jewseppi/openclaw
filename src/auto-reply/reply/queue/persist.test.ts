@@ -539,7 +539,6 @@ describe("persistFollowupQueues / restoreFollowupQueues", () => {
     const run = makeRun();
     run.chatType = "direct";
     run.clientCaps = ["images", "voice"];
-    run.channelContext = { chat: { id: "12345", extra: "open-ended-identity" } };
     run.spawnedBy = "agent:main:telegram:direct:seed";
     run.approvalReviewerDeviceId = "device-7";
     run.taskSuggestionDeliveryMode = "gateway";
@@ -567,9 +566,6 @@ describe("persistFollowupQueues / restoreFollowupQueues", () => {
     expect(followupQueueEntryContainsPrompt(TEST_KEY, "nested-static-do-not-leak")).toBe(false);
     expect(JSON.stringify(readPersistedQueueEntry(TEST_KEY) ?? {})).not.toContain(
       "nested-static-do-not-leak",
-    );
-    expect(JSON.stringify(readPersistedQueueEntry(TEST_KEY) ?? {})).not.toContain(
-      "open-ended-identity",
     );
     FOLLOWUP_QUEUES.delete(TEST_KEY);
     clearFollowupQueuesRestoredFlagForTest();

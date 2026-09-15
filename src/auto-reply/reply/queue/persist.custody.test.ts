@@ -158,4 +158,21 @@ describe("followup queue durable custody", () => {
     expect(prompts(restored?.items)).toEqual(["uncovered gateway item"]);
     expect(prompts(restored?.summarySources)).toEqual(["uncovered summary"]);
   });
+
+  it("does not write sender-bound channel turns, so a revoked sender cannot replay them", () => {
+    const queue = getFollowupQueue(TEST_KEY, SETTINGS);
+    const senderBound = makeFollowupRun("sender-bound turn");
+    senderBound.run = { ...senderBound.run, senderId: "telegram-user-1", senderName: "Ada" };
+    queue.items.push(senderBound, makeFollowupRun("sender-free turn"));
+    persistFollowupQueuesOrThrow();
+
+    expect(followupQueueEntryContainsPrompt(TEST_KEY, "sender-bound turn")).toBe(false);
+    expect(followupQueueEntryContainsPrompt(TEST_KEY, "telegram-user-1")).toBe(false);
+    expect(followupQueueEntryContainsPrompt(TEST_KEY, "sender-free turn")).toBe(true);
+
+    FOLLOWUP_QUEUES.delete(TEST_KEY);
+    clearFollowupQueuesRestoredFlagForTest();
+    restoreFollowupQueues();
+    expect(prompts(FOLLOWUP_QUEUES.get(TEST_KEY)?.items)).toEqual(["sender-free turn"]);
+  });
 });

@@ -561,7 +561,23 @@ function isCanonicallyOwnedFollowup(item: FollowupRun): boolean {
 }
 
 /**
- * Drop receipt-owned sources while keeping each retained source paired with its
+ * Work whose admission depended on the channel sender.
+ *
+ * Sender identity is never persisted, so a restored turn could not re-run the
+ * channel's access policy before reaching the model, tools, or the channel. A
+ * sender removed from that policy while the turn waited would still be served.
+ * These turns are not written at all rather than written only to fail closed.
+ */
+function isSenderBoundFollowup(item: FollowupRun): boolean {
+  return persistedRunCarriesRawChannelIdentity(item.run);
+}
+
+function isOutsideDurableQueueCustody(item: FollowupRun): boolean {
+  return isCanonicallyOwnedFollowup(item) || isSenderBoundFollowup(item);
+}
+
+/**
+ * Drop sources outside durable custody while keeping each retained source paired with its
  * summary line. Restore rejects the whole group when the two lengths disagree,
  * so the filter has to move both arrays together.
  */
@@ -573,14 +589,14 @@ function retainPersistableSummarySources(
     // Unpaired input is already outside the restore contract; leave it for the
     // existing fail-closed path rather than inventing an alignment here.
     return {
-      sources: sources.filter((source) => !isCanonicallyOwnedFollowup(source)),
+      sources: sources.filter((source) => !isOutsideDurableQueueCustody(source)),
       lines: [...lines],
     };
   }
   const retainedSources: FollowupRun[] = [];
   const retainedLines: string[] = [];
   for (const [index, source] of sources.entries()) {
-    if (isCanonicallyOwnedFollowup(source)) {
+    if (isOutsideDurableQueueCustody(source)) {
       continue;
     }
     retainedSources.push(source);
@@ -599,7 +615,7 @@ export function toPersistedQueueEntry(queue: FollowupQueueState): PersistedQueue
     ...[...queue.inFlight].filter(
       (source) => !queue.items.includes(source) && !summarizedSources.has(source),
     ),
-  ].filter((item) => !isCanonicallyOwnedFollowup(item));
+  ].filter((item) => !isOutsideDurableQueueCustody(item));
   const summary = retainPersistableSummarySources(queue.summarySources, queue.summaryLines);
   return {
     // Keep in-flight identities in SQLite until channel delivery succeeds (or
@@ -658,8 +674,9 @@ export function rehydratePersistedFollowupRun(
     ...rest,
     run: rehydrateRun(persisted.run, currentConfig),
   };
-  // Restore always drops raw sender identity. Collect grouping still keys on
-  // those fields, so identity-less entries must not share a batch.
+  // Restored entries never carry sender identity: sender-bound turns are not
+  // persisted and legacy rows that carry it fail closed. Collect grouping keys
+  // on those fields, so identity-less entries still must not share a batch.
   restored.disableCollectBatching = true;
   if (explicitSkillSelections) {
     restored.explicitSkillSelections = explicitSkillSelections;

@@ -57,25 +57,33 @@ describe("persistFollowupQueues restore identity", () => {
     restoreFollowupQueues();
   }
 
-  it("does not persist or restore raw channel identities or owner privilege", () => {
+  it("does not persist sender-bound turns, raw channel identities, or owner privilege", () => {
+    const senderRun = makeRun();
+    senderRun.senderId = "telegram-user-1";
+    senderRun.senderName = "Ada";
+    senderRun.senderUsername = "ada";
+    senderRun.senderE164 = "+15550000000";
+    senderRun.channelContext = { chat: { id: "12345", extra: "open-ended-identity" } };
     const run = makeRun();
-    run.senderId = "telegram-user-1";
-    run.senderName = "Ada";
-    run.senderUsername = "ada";
-    run.senderE164 = "+15550000000";
-    run.channelContext = { chat: { id: "12345", extra: "open-ended-identity" } };
     run.senderIsOwner = true;
     run.traceAuthorized = true;
     run.ownerNumbers = ["+15550000000"];
     const queue = getFollowupQueue(TEST_KEY, SETTINGS);
-    queue.items.push({ ...makeFollowupRun("owner-turn"), run });
-    queue.lastRun = run;
+    queue.items.push(
+      { ...makeFollowupRun("sender-turn"), run: senderRun },
+      { ...makeFollowupRun("owner-turn"), run },
+    );
+    queue.lastRun = { ...senderRun, senderIsOwner: true };
     persistFollowupQueues();
 
     const persisted = readPersistedQueueEntry(TEST_KEY) as {
-      items: Array<{ run: Record<string, unknown> }>;
+      items: Array<{ prompt: string; run: Record<string, unknown> }>;
       lastRun?: Record<string, unknown>;
     };
+    expect(persisted.items.map((item) => item.prompt)).toEqual(["owner-turn"]);
+    expect(JSON.stringify(persisted)).not.toContain("sender-turn");
+    expect(persisted.lastRun).not.toHaveProperty("senderId");
+    expect(persisted.lastRun).not.toHaveProperty("channelContext");
     expect(persisted.items[0]?.run).not.toHaveProperty("senderId");
     expect(persisted.items[0]?.run).not.toHaveProperty("senderName");
     expect(persisted.items[0]?.run).not.toHaveProperty("senderUsername");
@@ -110,11 +118,8 @@ describe("persistFollowupQueues restore identity", () => {
   it("marks restored identity-less collect entries for individual draining", () => {
     const collectSettings = { ...SETTINGS, mode: "collect" as const, debounceMs: 0 };
     const queue = getFollowupQueue(TEST_KEY, collectSettings);
-    for (const senderId of ["user-1", "user-2"]) {
-      const run = makeRun();
-      run.senderId = senderId;
-      run.senderName = senderId;
-      queue.items.push({ ...makeFollowupRun(`from ${senderId}`), run });
+    for (const label of ["first", "second"]) {
+      queue.items.push(makeFollowupRun(`${label} queued turn`));
     }
     persistFollowupQueues();
 
@@ -122,13 +127,15 @@ describe("persistFollowupQueues restore identity", () => {
       items: Array<{ run: Record<string, unknown>; disableCollectBatching?: boolean }>;
     };
     expect(persisted.items).toHaveLength(2);
-    expect(persisted.items.every((item) => !item.run.senderId)).toBe(true);
 
     restorePersistedQueueForTest();
 
     const restored = FOLLOWUP_QUEUES.get(TEST_KEY)?.items ?? [];
     expect(restored).toHaveLength(2);
-    expect(restored.map((item) => item.prompt)).toEqual(["from user-1", "from user-2"]);
+    expect(restored.map((item) => item.prompt)).toEqual([
+      "first queued turn",
+      "second queued turn",
+    ]);
     expect(restored.every((item) => item.disableCollectBatching === true)).toBe(true);
     expect(restored.every((item) => item.run.senderId === undefined)).toBe(true);
   });
@@ -837,7 +844,7 @@ describe("persistFollowupQueues restore identity", () => {
     expect(persisted.lastRun?.inputProvenance).not.toHaveProperty("sourceSessionKey");
   });
 
-  it("strips raw channel identities from restored rows and rewrites SQLite", () => {
+  it("fail-closes legacy rows that carry raw channel identity and scrubs them from SQLite", () => {
     const validRun = makeRun();
     replaceFollowupQueueEntries({
       entries: [
@@ -859,6 +866,13 @@ describe("persistFollowupQueues restore identity", () => {
                   channelContext: { chat: { id: "12345", extra: "open-ended-identity" } },
                 },
               },
+              {
+                prompt: "legacy-sender-free",
+                enqueuedAt: Date.now(),
+                originatingChannel: "telegram",
+                originatingTo: "12345",
+                run: validRun,
+              },
             ],
             lastRun: {
               ...validRun,
@@ -874,18 +888,24 @@ describe("persistFollowupQueues restore identity", () => {
       ],
     });
 
-    restoreFollowupQueues();
+    const errorSpy = vi.spyOn(defaultRuntime, "error").mockImplementation(() => {});
+    try {
+      restoreFollowupQueues();
+      const logged = errorSpy.mock.calls
+        .map((call) => (typeof call[0] === "string" ? call[0] : ""))
+        .join("\n");
+      expect(logged).toContain("sender-admitted work cannot revalidate channel access");
+      expect(logged).not.toContain("legacy-identity");
+    } finally {
+      errorSpy.mockRestore();
+    }
     const restored = FOLLOWUP_QUEUES.get(TEST_KEY);
-    expect(restored?.items.map((item) => item.prompt)).toEqual(["legacy-identity"]);
-    expect(restored?.items[0]?.run.senderId).toBeUndefined();
-    expect(restored?.items[0]?.run.senderName).toBeUndefined();
-    expect(restored?.items[0]?.run.senderUsername).toBeUndefined();
-    expect(restored?.items[0]?.run.senderE164).toBeUndefined();
-    expect(restored?.items[0]?.run.channelContext).toBeUndefined();
+    expect(restored?.items.map((item) => item.prompt)).toEqual(["legacy-sender-free"]);
     expect(restored?.items[0]?.originatingChannel).toBe("telegram");
     expect(restored?.items[0]?.originatingTo).toBe("12345");
     expect(restored?.lastRun?.senderId).toBeUndefined();
     expect(restored?.lastRun?.channelContext).toBeUndefined();
+    expect(followupQueueEntryContainsPrompt(TEST_KEY, "legacy-identity")).toBe(false);
 
     const persisted = readPersistedQueueEntry(TEST_KEY) as {
       items: Array<{ run: Record<string, unknown> }>;

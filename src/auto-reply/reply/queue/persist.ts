@@ -336,7 +336,7 @@ export function persistFollowupQueuesOrThrow(): void {
     }
     const entry = toPersistedQueueEntry(queue);
     if (!persistedQueueEntryCarriesWork(entry)) {
-      // Everything in this queue belongs to a canonical durable owner.
+      // Nothing in this queue is eligible for durable custody here.
       // Writing an empty row would claim durable authority this queue does not have.
       continue;
     }

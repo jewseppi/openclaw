@@ -68,6 +68,10 @@ const RESTORE_FAIL_CLOSE_GUARDS: readonly RestoreFailCloseGuard[] = [
     reason: "delegated handoff or plugin tool grant cannot be revalidated after restart",
   },
   {
+    blocks: (item) => persistedRunCarriesRawChannelIdentity(item.run),
+    reason: "sender-admitted work cannot revalidate channel access after restart",
+  },
+  {
     blocks: (item) => isCanceledPersistedFollowup(item),
     reason: "canceled work cannot execute after restart",
   },

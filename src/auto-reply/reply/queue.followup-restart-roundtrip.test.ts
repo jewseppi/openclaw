@@ -149,7 +149,7 @@ describe("followup queue restart round-trip (real shared SQLite state)", () => {
     }
   });
 
-  it("drains restored identity-less collect entries from two senders individually", async () => {
+  it("drains restored collect entries individually after a restart", async () => {
     const tmpDir = tempDirs.make("openclaw-followup-collect-restore-");
     const originalStateDir = process.env.OPENCLAW_STATE_DIR;
     process.env.OPENCLAW_STATE_DIR = tmpDir;
@@ -164,23 +164,23 @@ describe("followup queue restart round-trip (real shared SQLite state)", () => {
 
     try {
       simulateGatewayRestart();
-      for (const senderId of ["user-1", "user-2"]) {
+      for (const label of ["first", "second"]) {
         const item = createRun({
-          prompt: `from ${senderId}`,
+          prompt: `${label} queued turn`,
           originatingChannel: "telegram",
           originatingTo: "12345",
         });
         enqueueFollowupRun(
           key,
-          { ...item, run: { ...item.run, senderId, senderIsOwner: false } },
+          { ...item, run: { ...item.run, senderIsOwner: false } },
           settings,
           "message-id",
           undefined,
           false,
         );
       }
-      expect(followupQueueEntryContainsPrompt(key, "from user-1")).toBe(true);
-      expect(followupQueueEntryContainsPrompt(key, "from user-2")).toBe(true);
+      expect(followupQueueEntryContainsPrompt(key, "first queued turn")).toBe(true);
+      expect(followupQueueEntryContainsPrompt(key, "second queued turn")).toBe(true);
 
       simulateGatewayRestart();
       restoreFollowupQueues();
@@ -212,7 +212,10 @@ describe("followup queue restart round-trip (real shared SQLite state)", () => {
       }
 
       expect(deliveries).toHaveLength(2);
-      expect(deliveries.map((run) => run.prompt)).toEqual(["from user-1", "from user-2"]);
+      expect(deliveries.map((run) => run.prompt)).toEqual([
+        "first queued turn",
+        "second queued turn",
+      ]);
       expect(
         deliveries.every((run) => !run.prompt.includes("[Queued messages while agent was busy]")),
       ).toBe(true);
