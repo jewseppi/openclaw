@@ -266,7 +266,7 @@ export function isDeliverablePersistedFollowup(
  * Bind restored work to the fresh queue abort controller so `clearFollowupQueue`
  * can cancel restarted items and overflow sources through the normal drain path.
  */
-export function bindRestoredRunsToQueueAbort(queue: FollowupQueueState): void {
+function bindRestoredRunsToQueueAbort(queue: FollowupQueueState): void {
   const signal = queue.abortController.signal;
   for (const item of queue.items) {
     item.queueAbortSignal = signal;
