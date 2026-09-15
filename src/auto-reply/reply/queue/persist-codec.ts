@@ -7,7 +7,10 @@ import {
 } from "../../../agents/tool-policy.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import { normalizeCronScheduledToolPolicy } from "../../../cron/scheduled-tool-policy.js";
-import { resolveWorkspaceSkillPromptEntries } from "../../../skills/loading/workspace-skill-loader.js";
+import {
+  filterWorkspaceSkills,
+  loadWorkspaceSkills,
+} from "../../../skills/loading/workspace-skill-loader.js";
 import {
   hasInvalidInputProvenance,
   hasInvalidRestrictiveExecOverrides,
@@ -282,10 +285,13 @@ export function createExplicitSkillRestoreResolver(
       return catalogs.get(key) ?? null;
     }
     try {
-      const eligible = resolveWorkspaceSkillPromptEntries(workspaceDir, {
-        config: currentConfig,
-        agentId,
-      }).eligible.map((entry) => ({
+      // Restore runs synchronously during module evaluation, so it reads the
+      // synchronous inventory. The explicit filter pass keeps config-disabled
+      // skills out even when no agent skill filter applies.
+      const eligible = filterWorkspaceSkills(
+        loadWorkspaceSkills(workspaceDir, { config: currentConfig, agentId }),
+        { config: currentConfig },
+      ).map((entry) => ({
         name: entry.skill.name,
         path: entry.skill.filePath,
       }));
@@ -535,16 +541,23 @@ function toPersistedRun(item: FollowupRun): PersistedFollowupRun {
 }
 
 /**
- * Work already held by the canonical pending-input owner.
+ * Work already held by a canonical durable owner.
  *
- * `stageApproved` writes a durable receipt before acknowledgement, and that
- * owner runs its own restart recovery with fresh-admission checks. A second
- * runnable copy here would replay accepted input outside `withPendingInput`,
- * so the original receipt would stay claimable and the turn could execute
- * twice. This queue persists only routes the receipt owner does not cover.
+ * - `stageApproved` writes a pending-input receipt before acknowledgement, and
+ *   that owner runs its own restart recovery with fresh-admission checks.
+ * - Durable channel ingress admits turns with an `exclusive` adoption lifecycle
+ *   and holds its claim until adoption, so its restart recovery replays the
+ *   event through channel admission again.
+ *
+ * A second runnable copy here would replay accepted input outside those owners
+ * while the original receipt or ingress claim stayed claimable, so the turn
+ * could execute twice. This queue persists only work neither owner covers.
  */
-function isCanonicalPendingInputOwnedFollowup(item: FollowupRun): boolean {
-  return item.userTurnTranscriptRecorder?.getPendingInputMessage?.() !== undefined;
+function isCanonicallyOwnedFollowup(item: FollowupRun): boolean {
+  return (
+    item.userTurnTranscriptRecorder?.getPendingInputMessage?.() !== undefined ||
+    item.turnAdoptionLifecycle?.admission === "exclusive"
+  );
 }
 
 /**
@@ -560,14 +573,14 @@ function retainPersistableSummarySources(
     // Unpaired input is already outside the restore contract; leave it for the
     // existing fail-closed path rather than inventing an alignment here.
     return {
-      sources: sources.filter((source) => !isCanonicalPendingInputOwnedFollowup(source)),
+      sources: sources.filter((source) => !isCanonicallyOwnedFollowup(source)),
       lines: [...lines],
     };
   }
   const retainedSources: FollowupRun[] = [];
   const retainedLines: string[] = [];
   for (const [index, source] of sources.entries()) {
-    if (isCanonicalPendingInputOwnedFollowup(source)) {
+    if (isCanonicallyOwnedFollowup(source)) {
       continue;
     }
     retainedSources.push(source);
@@ -586,7 +599,7 @@ export function toPersistedQueueEntry(queue: FollowupQueueState): PersistedQueue
     ...[...queue.inFlight].filter(
       (source) => !queue.items.includes(source) && !summarizedSources.has(source),
     ),
-  ].filter((item) => !isCanonicalPendingInputOwnedFollowup(item));
+  ].filter((item) => !isCanonicallyOwnedFollowup(item));
   const summary = retainPersistableSummarySources(queue.summarySources, queue.summaryLines);
   return {
     // Keep in-flight identities in SQLite until channel delivery succeeds (or

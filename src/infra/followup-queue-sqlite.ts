@@ -68,6 +68,24 @@ export function listFollowupQueueKeys(stateDir?: string): string[] {
   return rows.map((row) => row.queue_key);
 }
 
+/**
+ * Read one queue row. Returns undefined when the key has no row; throws when the
+ * database cannot be read or the row is corrupt, so callers never mistake an
+ * unreadable row for an absent one.
+ */
+export function loadFollowupQueueEntry(queueKey: string, stateDir?: string): unknown {
+  const database = openQueueDatabase(stateDir);
+  const queueDb = getNodeSqliteKysely<FollowupQueueDatabase>(database.db);
+  const row = executeSqliteQueryTakeFirstSync(
+    database.db,
+    queueDb
+      .selectFrom("followup_queue_entries")
+      .select(["queue_json"])
+      .where("queue_key", "=", queueKey),
+  );
+  return row === undefined ? undefined : (JSON.parse(row.queue_json) as unknown);
+}
+
 export function replaceFollowupQueueEntries(params: {
   entries: Array<[string, unknown]>;
   stateDir?: string;

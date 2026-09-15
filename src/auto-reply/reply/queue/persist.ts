@@ -5,6 +5,7 @@ import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import {
   hasFollowupQueueEntries,
   loadFollowupQueueEntries,
+  loadFollowupQueueEntry,
   replaceFollowupQueueEntries,
 } from "../../../infra/followup-queue-sqlite.js";
 import { defaultRuntime } from "../../../runtime.js";
@@ -13,52 +14,28 @@ import {
   resolveGlobalSet,
   resolveGlobalSingleton,
 } from "../../../shared/global-singleton.js";
-import { normalizeQueueDropPolicy, normalizeQueueMode } from "./normalize.js";
-import {
-  isExpiredPersistedFollowup,
-  persistedFollowupCarriesInlineImagePayload,
-} from "./persist-codec-policy.js";
 import {
   createExplicitSkillRestoreResolver,
-  describeFollowupForLog,
-  hasInvalidExplicitSkillSelections,
-  hasInvalidInputProvenance,
-  hasInvalidRestrictiveExecOverrides,
-  hasInvalidScheduledToolPolicy,
-  hasInvalidSessionPermissionPolicy,
-  hasInvalidSkillWorkshopProposalRevision,
-  hasInvalidTerminalReplyExpectation,
-  hasInvalidToolsAllowIntersection,
-  isCanceledPersistedFollowup,
-  isDelegatedAuthorityPersistedFollowup,
-  isDeliveredPersistedFollowup,
-  isDiscardedPersistedFollowup,
   isPersistedQueueEntry,
-  isPersistedRunFields,
-  isRoleDependentPersistedFollowup,
-  persistedFollowupItemCarriesInboundContext,
-  persistedInputProvenanceCarriesSourceIdentity,
-  persistedRunCarriesRawChannelIdentity,
-  rehydratePersistedFollowupRun,
-  rehydrateRun,
   toPersistedQueueEntry,
-  type PersistedFollowupRun,
-  type ExplicitSkillRestoreResolution,
   type PersistedQueueEntry,
-  type RestoredExplicitSkillSelections,
 } from "./persist-codec.js";
 import {
+  bindRestoredRunsToQueueAbort,
+  isDeliverablePersistedFollowup,
+  restorePersistedFollowupQueueEntry,
+} from "./persist-restore-entry.js";
+import {
+  claimUnreconciledFollowupQueueKeys,
   clearFollowupQueueLocalOwnershipForTest,
+  isFollowupQueueKeyLocallyOwned,
+  isFollowupQueueKeyUnreconciled,
   isIncognitoFollowupQueue,
   markFollowupQueueKeyLocallyOwned,
   persistedQueueEntryCarriesWork,
   resolveFollowupQueueRetainKeys,
 } from "./persist-snapshot-policy.js";
-import type { FollowupQueueState, FollowupRun, QueueDropPolicy } from "./types.js";
-
-const DEFAULT_QUEUE_DEBOUNCE_MS = 500;
-const DEFAULT_QUEUE_CAP = 20;
-const DEFAULT_QUEUE_DROP: QueueDropPolicy = "summarize";
+import type { FollowupQueueState } from "./types.js";
 
 const FOLLOWUP_QUEUES = resolveGlobalMap<string, FollowupQueueState>(
   Symbol.for("openclaw.followupQueues"),
@@ -286,219 +263,6 @@ function resolveCurrentRunConfig(): OpenClawConfig {
   }
 }
 
-type RestoreFailCloseGuard = {
-  blocks: (
-    item: PersistedFollowupRun,
-    resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
-  ) => boolean;
-  reason: string;
-};
-
-/**
- * Restore fail-close guards, evaluated in order. Pairing each predicate with
- * its log reason keeps the block decision and the operator-facing message from
- * drifting apart.
- */
-const RESTORE_FAIL_CLOSE_GUARDS: readonly RestoreFailCloseGuard[] = [
-  {
-    blocks: (item) => isRoleDependentPersistedFollowup(item),
-    reason: "role-dependent work cannot revalidate member roles after restart",
-  },
-  {
-    blocks: (item) => isDelegatedAuthorityPersistedFollowup(item),
-    reason: "delegated handoff or plugin tool grant cannot be revalidated after restart",
-  },
-  {
-    blocks: (item) => isCanceledPersistedFollowup(item),
-    reason: "canceled work cannot execute after restart",
-  },
-  {
-    blocks: (item) => isDeliveredPersistedFollowup(item),
-    reason: "already-delivered work cannot replay after restart",
-  },
-  {
-    blocks: (item) => isDiscardedPersistedFollowup(item),
-    reason: "undelivered completed work cannot replay after restart",
-  },
-  {
-    blocks: (item) => persistedFollowupCarriesInlineImagePayload(item),
-    reason: "inline image payloads are never retained across restarts",
-  },
-  {
-    blocks: (item) => isExpiredPersistedFollowup(item),
-    reason: "queued work exceeded the bounded retention window",
-  },
-  {
-    blocks: (item) => hasInvalidScheduledToolPolicy(item.run),
-    reason: "scheduled tool policy is missing or invalid after restart",
-  },
-  {
-    blocks: (item) => hasInvalidSessionPermissionPolicy(item.run),
-    reason: "session permission policy is missing or invalid after restart",
-  },
-  {
-    blocks: (item) => hasInvalidRestrictiveExecOverrides(item.run),
-    reason: "exec override policy is missing or invalid after restart",
-  },
-  {
-    blocks: (item) => hasInvalidSkillWorkshopProposalRevision(item.run),
-    reason: "Skill Workshop revision constraint is missing or invalid after restart",
-  },
-  {
-    blocks: (item) => hasInvalidTerminalReplyExpectation(item.run),
-    reason: "terminal reply expectation is missing or invalid after restart",
-  },
-  {
-    blocks: (item) => hasInvalidInputProvenance(item.run),
-    reason: "input provenance is missing or invalid after restart",
-  },
-  {
-    blocks: (item) => hasInvalidToolsAllowIntersection(item),
-    reason: "tool allowlist intersection cannot restore without toolsAllow",
-  },
-  {
-    blocks: (item, resolve) => hasInvalidExplicitSkillSelections(item, resolve),
-    reason: "explicit skill selections are missing or invalid after restart",
-  },
-];
-
-function findRestoreFailCloseReason(
-  item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
-): string | undefined {
-  return RESTORE_FAIL_CLOSE_GUARDS.find((guard) =>
-    guard.blocks(item, resolveExplicitSkillSelections),
-  )?.reason;
-}
-
-function isUnrestorablePersistedFollowup(
-  item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
-): boolean {
-  return findRestoreFailCloseReason(item, resolveExplicitSkillSelections) !== undefined;
-}
-
-function failClosedUnrestorablePersistedFollowup(
-  queueKey: string,
-  item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
-): boolean {
-  const reason = findRestoreFailCloseReason(item, resolveExplicitSkillSelections);
-  if (reason === undefined) {
-    return false;
-  }
-  defaultRuntime.error?.(
-    `fail-closed restored followup for ${queueKey}: ${reason} (${describeFollowupForLog(item)})`,
-  );
-  return true;
-}
-
-function rehydrateRestorablePersistedFollowups(
-  queueKey: string,
-  items: readonly PersistedFollowupRun[],
-  currentConfig: OpenClawConfig,
-  pairedLines?: readonly string[],
-  resolveExplicitSkillSelections: (
-    item: PersistedFollowupRun,
-  ) => ExplicitSkillRestoreResolution = createExplicitSkillRestoreResolver(currentConfig),
-): { restored: FollowupRun[]; restoredLines: string[]; skippedUnrestorable: boolean } {
-  const candidates: Array<{
-    item: PersistedFollowupRun;
-    line?: string;
-    explicitSkillSelections?: RestoredExplicitSkillSelections;
-  }> = [];
-  let skippedUnrestorable = false;
-  if (pairedLines !== undefined && pairedLines.length !== items.length) {
-    skippedUnrestorable = true;
-  }
-  const limit =
-    pairedLines === undefined ? items.length : Math.min(items.length, pairedLines.length);
-  for (let index = 0; index < limit; index += 1) {
-    const item = items[index]!;
-    if (failClosedUnrestorablePersistedFollowup(queueKey, item, resolveExplicitSkillSelections)) {
-      skippedUnrestorable = true;
-      continue;
-    }
-    const explicitSkillSelections = resolveExplicitSkillSelections(item);
-    candidates.push({
-      item,
-      line: pairedLines?.[index],
-      ...(explicitSkillSelections.status === "ok"
-        ? { explicitSkillSelections: explicitSkillSelections.selections }
-        : {}),
-    });
-  }
-  for (let index = limit; index < items.length; index += 1) {
-    skippedUnrestorable = true;
-    failClosedUnrestorablePersistedFollowup(
-      queueKey,
-      items[index]!,
-      resolveExplicitSkillSelections,
-    );
-  }
-
-  const restored: FollowupRun[] = [];
-  const restoredLines: string[] = [];
-  for (const candidate of candidates) {
-    const [kept] = filterRestorableFollowupItems(queueKey, [
-      rehydratePersistedFollowupRun(
-        candidate.item,
-        currentConfig,
-        candidate.explicitSkillSelections,
-      ),
-    ]);
-    if (!kept) {
-      skippedUnrestorable = true;
-      continue;
-    }
-    restored.push(kept);
-    if (candidate.line !== undefined) {
-      restoredLines.push(candidate.line);
-    }
-  }
-  return { restored, restoredLines, skippedUnrestorable };
-}
-
-function filterRestorableFollowupItems(queueKey: string, items: FollowupRun[]): FollowupRun[] {
-  const restored: FollowupRun[] = [];
-  for (const item of items) {
-    const sessionKey = normalizeOptionalString(item.run.sessionKey);
-    if (sessionKey && sessionKey !== queueKey && !queueKey.startsWith(`${sessionKey}:`)) {
-      defaultRuntime.error?.(
-        `skipping restored followup for ${queueKey}: sessionKey ${sessionKey} does not match queue key`,
-      );
-      continue;
-    }
-    const channel = normalizeOptionalString(item.originatingChannel);
-    const to = normalizeOptionalString(item.originatingTo);
-    if ((channel && !to) || (!channel && to)) {
-      defaultRuntime.error?.(
-        `skipping restored followup for ${queueKey}: incomplete originating route (${channel ?? "?"} -> ${to ?? "?"})`,
-      );
-      continue;
-    }
-    restored.push(item);
-  }
-  return restored;
-}
-
-function isDeliverablePersistedFollowup(
-  queueKey: string,
-  item: PersistedFollowupRun,
-  resolveExplicitSkillSelections: (item: PersistedFollowupRun) => ExplicitSkillRestoreResolution,
-): boolean {
-  const sessionKey = normalizeOptionalString(item.run.sessionKey);
-  if (sessionKey && sessionKey !== queueKey && !queueKey.startsWith(`${sessionKey}:`)) {
-    return false;
-  }
-  const channel = normalizeOptionalString(item.originatingChannel);
-  const to = normalizeOptionalString(item.originatingTo);
-  if ((channel && !to) || (!channel && to)) {
-    return false;
-  }
-  return !isUnrestorablePersistedFollowup(item, resolveExplicitSkillSelections);
-}
-
 /**
  * True when this persisted entry would restore without skipping any
  * delivery-bearing source (items, overflow summarySources, or elision sources)
@@ -545,24 +309,6 @@ export function canMigrateFollowupQueueEntryLosslessly(
     isDeliverablePersistedFollowup(queueKey, item, resolveExplicitSkillSelections),
   );
 }
-/**
- * Bind restored work to the fresh queue abort controller so `clearFollowupQueue`
- * can cancel restarted items and overflow sources through the normal drain path.
- */
-function bindRestoredRunsToQueueAbort(queue: FollowupQueueState): void {
-  const signal = queue.abortController.signal;
-  for (const item of queue.items) {
-    item.queueAbortSignal = signal;
-  }
-  for (const source of queue.summarySources) {
-    source.queueAbortSignal = signal;
-  }
-  for (const elision of queue.summaryElisions) {
-    for (const source of elision.sources) {
-      source.queueAbortSignal = signal;
-    }
-  }
-}
 
 /**
  * Write all non-empty followup queues to disk so they survive gateway restarts.
@@ -571,33 +317,6 @@ function bindRestoredRunsToQueueAbort(queue: FollowupQueueState): void {
  * Rows stay in SQLite until delivery settles (successful channel handoff or
  * fail-closed discard). In-flight marks are process-local only.
  */
-function persistedQueueEntryRuns(data: PersistedQueueEntry): PersistedFollowupRun["run"][] {
-  return [
-    ...data.items.map((item) => item.run),
-    ...(data.summarySources ?? []).map((item) => item.run),
-    ...(data.summaryElisions ?? []).flatMap((elision) =>
-      elision.sources.map((source) => source.run),
-    ),
-    ...(data.lastRun ? [data.lastRun] : []),
-  ];
-}
-
-function persistedQueueEntryCarriesRawInputProvenance(data: PersistedQueueEntry): boolean {
-  return persistedQueueEntryRuns(data).some(persistedInputProvenanceCarriesSourceIdentity);
-}
-
-function persistedQueueEntryCarriesRawChannelIdentity(data: PersistedQueueEntry): boolean {
-  return persistedQueueEntryRuns(data).some(persistedRunCarriesRawChannelIdentity);
-}
-
-function persistedQueueEntryCarriesInboundContext(data: PersistedQueueEntry): boolean {
-  return [
-    ...data.items,
-    ...(data.summarySources ?? []),
-    ...(data.summaryElisions ?? []).flatMap((elision) => elision.sources),
-  ].some(persistedFollowupItemCarriesInboundContext);
-}
-
 export function persistFollowupQueuesOrThrow(): void {
   const entries: Array<[string, PersistedQueueEntry]> = [];
   for (const [key, queue] of FOLLOWUP_QUEUES) {
@@ -610,9 +329,14 @@ export function persistFollowupQueuesOrThrow(): void {
     if (isIncognitoFollowupQueue(key, queue)) {
       continue;
     }
+    if (isFollowupQueueKeyUnreconciled(key)) {
+      // The row could not be read when this queue materialized; an upsert would
+      // replace work this process never loaded. Restore merges and writes both.
+      continue;
+    }
     const entry = toPersistedQueueEntry(queue);
     if (!persistedQueueEntryCarriesWork(entry)) {
-      // Everything in this queue belongs to the canonical pending-input owner.
+      // Everything in this queue belongs to a canonical durable owner.
       // Writing an empty row would claim durable authority this queue does not have.
       continue;
     }
@@ -634,6 +358,79 @@ export function persistFollowupQueues(): void {
   } catch (err) {
     defaultRuntime.error?.(`failed to persist followup queues: ${String(err)}`);
   }
+}
+
+/**
+ * Register a restored row. A live queue that materialized while this key's row
+ * was unreadable keeps its newer work behind the restored entries.
+ */
+function installRestoredFollowupQueue(
+  key: string,
+  restored: FollowupQueueState,
+  mergeIntoLiveQueue: boolean,
+): FollowupQueueState {
+  const live = FOLLOWUP_QUEUES.get(key);
+  let queue = restored;
+  if (live && mergeIntoLiveQueue) {
+    live.items.unshift(...restored.items);
+    live.summarySources.unshift(...restored.summarySources);
+    live.summaryLines.unshift(...restored.summaryLines);
+    live.summaryElisions.unshift(...restored.summaryElisions);
+    live.droppedCount += restored.droppedCount;
+    live.evictedSummaryCount += restored.evictedSummaryCount;
+    live.lastRun ??= restored.lastRun;
+    bindRestoredRunsToQueueAbort(live);
+    queue = live;
+  } else {
+    FOLLOWUP_QUEUES.set(key, restored);
+  }
+  if (queue.items.length > 0 || queue.droppedCount > 0 || queue.summarySources.length > 0) {
+    restoredPendingDrainKeys.add(key);
+  }
+  return queue;
+}
+
+export type DurableFollowupQueueReconciliation =
+  | { kind: "restored"; queue: FollowupQueueState }
+  | { kind: "reconciled" }
+  | { kind: "unreadable" };
+
+/**
+ * Reconcile one key's durable row before a live queue claims it.
+ *
+ * Until startup restore completes, the row may still hold the previous
+ * process's work, and the next snapshot upsert would replace it with only the
+ * live entries. Restore that row first. When it cannot be read, report it so the
+ * caller leaves the key unreconciled and restore merges both later.
+ */
+export function reconcileDurableFollowupQueueKey(key: string): DurableFollowupQueueReconciliation {
+  if (hasFollowupQueuesRestored() || isFollowupQueueKeyLocallyOwned(key)) {
+    return { kind: "reconciled" };
+  }
+  let rawData: unknown;
+  try {
+    rawData = loadFollowupQueueEntry(key);
+  } catch (err) {
+    defaultRuntime.error?.(`failed to reconcile durable followup queue ${key}: ${String(err)}`);
+    return { kind: "unreadable" };
+  }
+  markFollowupQueueKeyLocallyOwned(key);
+  if (rawData === undefined) {
+    return { kind: "reconciled" };
+  }
+  const currentConfig = resolveCurrentRunConfig();
+  const entry = restorePersistedFollowupQueueEntry(
+    key,
+    rawData,
+    currentConfig,
+    createExplicitSkillRestoreResolver(currentConfig),
+  );
+  const queue = entry.queue ? installRestoredFollowupQueue(key, entry.queue, false) : undefined;
+  if (entry.needsRewrite) {
+    persistFollowupQueues();
+  }
+  notifyRestoredFollowupQueuesIfPending();
+  return queue ? { kind: "restored", queue } : { kind: "reconciled" };
 }
 
 /**
@@ -663,141 +460,42 @@ export function restoreFollowupQueues(): void {
   restoreCoordination.inFlight = false;
   restoreCoordination.retryCount = 0;
   try {
-    if (entries.length === 0) {
-      notifyRestoredFollowupQueuesIfPending();
-      return;
-    }
-    const currentConfig = resolveCurrentRunConfig();
-    const resolveExplicitSkillSelections = createExplicitSkillRestoreResolver(currentConfig);
-    let skippedUnrestorable = false;
-    let sanitizedClosedDescriptor = false;
-    for (const entry of entries) {
-      const key = normalizeOptionalString(Array.isArray(entry) ? entry[0] : undefined);
-      const rawData = Array.isArray(entry) ? entry[1] : undefined;
-      if (!key) {
-        continue;
-      }
-      // Reading the row transfers delete authority to this process, including
-      // for rows that fail closed below — the sanitizing persist must be able to
-      // remove them rather than retain them as unreconciled durable work.
-      markFollowupQueueKeyLocallyOwned(key);
-      if (!isPersistedQueueEntry(rawData)) {
-        skippedUnrestorable = true;
-        continue;
-      }
-      const data = rawData;
-      sanitizedClosedDescriptor ||= persistedQueueEntryCarriesRawInputProvenance(data);
-      sanitizedClosedDescriptor ||= persistedQueueEntryCarriesRawChannelIdentity(data);
-      sanitizedClosedDescriptor ||= persistedQueueEntryCarriesInboundContext(data);
-      const itemsRestore = rehydrateRestorablePersistedFollowups(
-        key,
-        data.items,
-        currentConfig,
-        undefined,
-        resolveExplicitSkillSelections,
-      );
-      skippedUnrestorable ||= itemsRestore.skippedUnrestorable;
-      const rehydratedItems = itemsRestore.restored;
-      const originalSummarySources = data.summarySources ?? [];
-      const originalSummaryLines = Array.isArray(data.summaryLines) ? data.summaryLines : [];
-      const summaryRestore = rehydrateRestorablePersistedFollowups(
-        key,
-        originalSummarySources,
-        currentConfig,
-        originalSummaryLines,
-        resolveExplicitSkillSelections,
-      );
-      skippedUnrestorable ||= summaryRestore.skippedUnrestorable;
-      const rehydratedSummarySources = summaryRestore.restored;
-      let removedOverflowCount = originalSummarySources.length - rehydratedSummarySources.length;
-      const restoredElisions = (data.summaryElisions ?? []).flatMap((elision) => {
-        let droppedElision = false;
-        for (const source of elision.sources) {
-          if (
-            failClosedUnrestorablePersistedFollowup(key, source, resolveExplicitSkillSelections)
-          ) {
-            skippedUnrestorable = true;
-            droppedElision = true;
-          }
+    let needsRewrite = false;
+    if (entries.length > 0) {
+      const currentConfig = resolveCurrentRunConfig();
+      const resolveExplicitSkillSelections = createExplicitSkillRestoreResolver(currentConfig);
+      for (const entry of entries) {
+        const key = normalizeOptionalString(Array.isArray(entry) ? entry[0] : undefined);
+        if (!key) {
+          continue;
         }
-        if (droppedElision) {
-          removedOverflowCount += elision.sources.length;
-          return [];
+        if (FOLLOWUP_QUEUES.has(key) && isFollowupQueueKeyLocallyOwned(key)) {
+          // A live queue already reconciled this row before restore could run.
+          continue;
         }
-        const sources = filterRestorableFollowupItems(
+        const mergeIntoLiveQueue = isFollowupQueueKeyUnreconciled(key);
+        // Reading the row transfers delete authority to this process, including
+        // for rows that fail closed below — the sanitizing persist must be able to
+        // remove them rather than retain them as unreconciled durable work.
+        markFollowupQueueKeyLocallyOwned(key);
+        const restored = restorePersistedFollowupQueueEntry(
           key,
-          elision.sources.map((persisted) => {
-            const resolved = resolveExplicitSkillSelections(persisted);
-            return rehydratePersistedFollowupRun(
-              persisted,
-              currentConfig,
-              resolved.status === "ok" ? resolved.selections : undefined,
-            );
-          }),
+          Array.isArray(entry) ? entry[1] : undefined,
+          currentConfig,
+          resolveExplicitSkillSelections,
         );
-        if (sources.length === 0 || sources.length !== elision.sources.length) {
-          skippedUnrestorable = true;
-          removedOverflowCount += elision.sources.length;
-          return [];
+        needsRewrite ||= restored.needsRewrite;
+        if (restored.queue) {
+          installRestoredFollowupQueue(key, restored.queue, mergeIntoLiveQueue);
         }
-        return [
-          {
-            contextKey: elision.contextKey,
-            count: elision.count,
-            sources,
-            summaryLines: [...elision.summaryLines],
-            sourceRefs: new WeakMap(),
-          },
-        ];
-      });
-      const hasSummaryPayload = rehydratedSummarySources.length > 0 || restoredElisions.length > 0;
-      if (rehydratedItems.length === 0 && !hasSummaryPayload) {
-        continue;
-      }
-      const originalDroppedCount =
-        typeof data.droppedCount === "number" ? Math.max(0, Math.floor(data.droppedCount)) : 0;
-      const restoredDroppedCount = hasSummaryPayload
-        ? Math.max(0, originalDroppedCount - removedOverflowCount)
-        : 0;
-      const restored: FollowupQueueState = {
-        abortController: new AbortController(),
-        items: rehydratedItems,
-        draining: false,
-        inFlight: new Set(),
-        lastEnqueuedAt: typeof data.lastEnqueuedAt === "number" ? data.lastEnqueuedAt : Date.now(),
-        mode: normalizeQueueMode(data.mode) ?? "steer",
-        debounceMs:
-          typeof data.debounceMs === "number"
-            ? Math.max(0, data.debounceMs)
-            : DEFAULT_QUEUE_DEBOUNCE_MS,
-        cap:
-          typeof data.cap === "number" && data.cap > 0 ? Math.floor(data.cap) : DEFAULT_QUEUE_CAP,
-        dropPolicy: normalizeQueueDropPolicy(data.dropPolicy) ?? DEFAULT_QUEUE_DROP,
-        droppedCount: restoredDroppedCount,
-        summaryLines: hasSummaryPayload ? summaryRestore.restoredLines : [],
-        summarySources: rehydratedSummarySources,
-        steerAcceptanceTail: Promise.resolve(true),
-        activeSummarySources: new WeakSet(),
-        summaryElisions: restoredElisions,
-        evictedSummaryCount:
-          typeof data.evictedSummaryCount === "number"
-            ? Math.max(0, Math.floor(data.evictedSummaryCount))
-            : 0,
-        ...(isPersistedRunFields(data.lastRun)
-          ? { lastRun: rehydrateRun(data.lastRun, currentConfig) }
-          : {}),
-      };
-      bindRestoredRunsToQueueAbort(restored);
-      FOLLOWUP_QUEUES.set(key, restored);
-      const hasPendingRestoredWork =
-        restored.items.length > 0 ||
-        restored.droppedCount > 0 ||
-        restored.summarySources.length > 0;
-      if (hasPendingRestoredWork) {
-        restoredPendingDrainKeys.add(key);
       }
     }
-    if (skippedUnrestorable || sanitizedClosedDescriptor) {
+    // Live queues whose rows were unreadable are reconciled now — merged above
+    // or backed by no row — so their work becomes durable with this snapshot.
+    const claimedLiveWork = claimUnreconciledFollowupQueueKeys().some((key) =>
+      FOLLOWUP_QUEUES.has(key),
+    );
+    if (needsRewrite || claimedLiveWork) {
       // Durable non-delivery: drop fail-closed rows, and rewrite descriptors
       // that still carried raw source-session provenance, sender/channel
       // identities, or current-turn inbound prompt context so restart cannot

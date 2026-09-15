@@ -264,8 +264,10 @@ export function createFollowupRunner(
       }
     } finally {
       const sourceDisposition = admittedTurn?.queued.queuedFollowupReplyDisposition;
+      // An undelivered execution still closes its source: the queued caller must
+      // observe the failed completion even though the runner refuses replay.
       if (
-        disposition.kind === "consumed" &&
+        (disposition.kind === "consumed" || disposition.kind === "undelivered") &&
         admittedTurn &&
         sourceDisposition?.kind === "deliver"
       ) {

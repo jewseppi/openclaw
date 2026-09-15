@@ -9,11 +9,13 @@ import { applyQueueRuntimeSettings } from "../../../utils/queue-helpers.js";
 import { normalizeThinkLevel, resolveSupportedThinkingLevel } from "../../thinking.js";
 import {
   markFollowupQueueKeyLocallyOwned,
+  markFollowupQueueKeyUnreconciled,
   releaseFollowupQueueKeyLocalOwnership,
 } from "./persist-snapshot-policy.js";
 import {
   clearRestoredPendingDrainKey,
   persistFollowupQueuesOrThrow,
+  reconcileDurableFollowupQueueKey,
   restoreFollowupQueues,
 } from "./persist.js";
 import {
@@ -169,6 +171,21 @@ export function getFollowupQueue(key: string, settings: QueueSettings): Followup
     return existing;
   }
 
+  // Before restore completes, this key's row may still hold the previous
+  // process's work. Restore it first so new work appends behind it instead of
+  // replacing it on the next snapshot upsert.
+  const reconciliation = reconcileDurableFollowupQueueKey(key);
+  if (reconciliation.kind === "restored") {
+    const restored = reconciliation.queue;
+    ensureFollowupQueueSummaryState(restored);
+    applyQueueRuntimeSettings({
+      target: restored,
+      settings,
+    });
+    persistCapDrivenElisionTrim(restored);
+    return restored;
+  }
+
   const created: FollowupQueueState = {
     abortController: new AbortController(),
     items: [],
@@ -197,9 +214,15 @@ export function getFollowupQueue(key: string, settings: QueueSettings): Followup
     target: created,
     settings,
   });
-  // Materializing the queue takes durable delete authority for this key, so a
-  // later snapshot may remove its row once the queue empties.
-  markFollowupQueueKeyLocallyOwned(key);
+  if (reconciliation.kind === "unreadable") {
+    // The row exists in an unknown state. Leave the key unclaimed so snapshots
+    // neither replace nor delete it; restore merges both once it can read it.
+    markFollowupQueueKeyUnreconciled(key);
+  } else {
+    // Materializing the queue takes durable delete authority for this key, so a
+    // later snapshot may remove its row once the queue empties.
+    markFollowupQueueKeyLocallyOwned(key);
+  }
   FOLLOWUP_QUEUES.set(key, created);
   return created;
 }
