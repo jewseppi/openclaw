@@ -587,7 +587,6 @@ describe("Telegram admitted model input", () => {
       expect(transcribe.mock.calls[0]?.[0].ctx).toMatchObject({
         OriginatingTo: "telegram:42001",
         AccountId: "atlas",
-        // Media scope rules match on chat type, so the preflight context must carry it.
         ChatType: "direct",
         MessageThreadId: threadId,
       });

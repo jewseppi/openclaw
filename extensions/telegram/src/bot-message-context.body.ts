@@ -243,7 +243,6 @@ export async function resolveTelegramInboundBody(params: {
         OriginatingChannel: "telegram",
         OriginatingTo: originatingTo,
         AccountId: accountId,
-        // Media scope rules can match on chat type; without it a `chatType` rule never applies here.
         ChatType: isGroup ? "group" : "direct",
         MessageThreadId: replyThreadId,
         media: materializedMedia,
